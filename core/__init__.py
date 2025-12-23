@@ -1,0 +1,1 @@
+# SmartCardReaderApp - Core modules
