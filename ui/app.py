@@ -30,7 +30,7 @@ class SmartCardApp(ctk.CTk):
         super().__init__()
 
         # Window config
-        self.title("Smart Card Reader")
+        self.title("Smart Card Reader — by jmanu1983")
         self.geometry("1280x850")
         self.minsize(1024, 700)
 

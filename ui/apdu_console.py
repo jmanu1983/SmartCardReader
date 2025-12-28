@@ -42,6 +42,8 @@ class APDUConsole(ctk.CTkFrame):
         # Welcome message
         self._console.insert("end", "═══════════════════════════════════════════════════\n")
         self._console.insert("end", "  APDU Console - Smart Card Reader\n")
+        self._console.insert("end", "  by jmanu1983\n")
+        self._console.insert("end", "───────────────────────────────────────────────────\n")
         self._console.insert("end", "  Enter hex APDU commands below.\n")
         self._console.insert("end", "  Example: 00 A4 04 00 07 A0000000030000 00\n")
         self._console.insert("end", "  Use UP/DOWN arrows for command history.\n")

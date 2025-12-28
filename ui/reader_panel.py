@@ -55,6 +55,14 @@ class ReaderPanel(ctk.CTkFrame):
             anchor="w"
         ).pack(fill="x")
 
+        ctk.CTkLabel(
+            title_frame,
+            text="by jmanu1983",
+            font=FONTS["small"],
+            text_color=COLORS["accent_purple"],
+            anchor="w"
+        ).pack(fill="x", pady=(PADDING["xs"], 0))
+
         # ─── Separator ──────────────────────────────────────────────
         ctk.CTkFrame(
             self, height=1,
