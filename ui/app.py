@@ -13,6 +13,7 @@ from .card_info_view import CardInfoView
 from .desfire_view import DESFireView
 from .javacard_view import JavaCardView
 from .diversification_view import DiversificationView
+from .legic_view import LegicView
 from .apdu_console import APDUConsole
 from .log_panel import LogPanel
 
@@ -20,6 +21,7 @@ from core.reader_manager import ReaderManager
 from core.atr_parser import ATRInfo
 from core.desfire import DESFireProtocol
 from core.javacard import JavaCardHandler
+from core.legic import LegicHandler
 from core.apdu import bytes_to_hex, hex_to_bytes
 
 
@@ -43,6 +45,7 @@ class SmartCardApp(ctk.CTk):
         self._reader_mgr = ReaderManager()
         self._desfire: Optional[DESFireProtocol] = None
         self._javacard: Optional[JavaCardHandler] = None
+        self._legic: Optional[LegicHandler] = None
         self._current_atr: Optional[ATRInfo] = None
         self._current_uid: list = []
 
@@ -101,6 +104,7 @@ class SmartCardApp(ctk.CTk):
         tab_card = self._tabview.add("Card Info")
         tab_desfire = self._tabview.add("DESFire")
         tab_javacard = self._tabview.add("JavaCard")
+        tab_legic = self._tabview.add("LEGIC")
         tab_diversification = self._tabview.add("Diversification")
         tab_console = self._tabview.add("APDU Console")
 
@@ -113,6 +117,9 @@ class SmartCardApp(ctk.CTk):
 
         self._javacard_view = JavaCardView(tab_javacard, self._handle_javacard_command)
         self._javacard_view.pack(fill="both", expand=True)
+
+        self._legic_view = LegicView(tab_legic, self._handle_legic_command)
+        self._legic_view.pack(fill="both", expand=True)
 
         self._diversification_view = DiversificationView(
             tab_diversification, self._get_current_uid
@@ -172,6 +179,7 @@ class SmartCardApp(ctk.CTk):
                 # Initialize protocol handlers
                 self._desfire = DESFireProtocol(self._reader_mgr.transmit)
                 self._javacard = JavaCardHandler(self._reader_mgr.transmit)
+                self._legic = LegicHandler(self._reader_mgr.transmit)
 
                 # Auto-detect DESFire
                 if self._current_atr.card_family in ("desfire", "mifare", "iso14443a"):
@@ -189,6 +197,7 @@ class SmartCardApp(ctk.CTk):
         self._reader_mgr.disconnect()
         self._desfire = None
         self._javacard = None
+        self._legic = None
         self._current_atr = None
         self._current_uid = []
         self._reader_panel.set_status(False)
@@ -339,6 +348,41 @@ class SmartCardApp(ctk.CTk):
 
         except Exception as e:
             self._log.error(f"JavaCard command error: {e}")
+            return None
+
+    # ─── LEGIC Command Handler ──────────────────────────────────────────
+
+    def _handle_legic_command(self, command: str, **kwargs):
+        """Handle commands from the LEGIC view."""
+        if not self._legic:
+            self._log.error("Not connected to a card")
+            return None
+
+        try:
+            if command == "legic_info":
+                result = self._legic.get_card_info()
+                if result.get("uid"):
+                    self._log.info(f"LEGIC UID: {result.get('uid_hex', '?')}")
+                return result
+
+            elif command == "legic_uid":
+                return self._legic.get_uid()
+
+            elif command == "legic_detect":
+                atr = self._reader_mgr.get_atr() or []
+                return self._legic.detect_card_type(atr)
+
+            elif command == "legic_ats":
+                return self._legic.get_ats()
+
+            elif command == "legic_read":
+                return self._legic.read_memory(
+                    kwargs.get("offset", 0),
+                    kwargs.get("length", 16)
+                )
+
+        except Exception as e:
+            self._log.error(f"LEGIC command error: {e}")
             return None
 
     # ─── Utility ────────────────────────────────────────────────────────
