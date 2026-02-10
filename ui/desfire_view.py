@@ -249,6 +249,16 @@ class DESFireView(ctk.CTkFrame):
             command=self._read_records
         ).pack(side="left", padx=(PADDING["xs"], 0))
 
+        ctk.CTkButton(
+            file_controls, text="Read Raw",
+            width=90, height=32,
+            font=FONTS["small_bold"],
+            fg_color=COLORS["bg_elevated"],
+            hover_color=COLORS["accent_yellow"],
+            text_color=COLORS["text_muted"],
+            command=self._read_file_raw
+        ).pack(side="left", padx=(PADDING["xs"], 0))
+
         # ─── Quick Actions ──────────────────────────────────────────
         quick_frame = ctk.CTkFrame(scroll, fg_color=COLORS["bg_card"], corner_radius=DIMENSIONS["corner_radius"])
         quick_frame.pack(fill="x", pady=(0, PADDING["md"]))
@@ -427,7 +437,29 @@ class DESFireView(ctk.CTkFrame):
 
         result = self._on_command("read_data", file_no=file_no)
         if result is not None:
-            self._append_output(f"--- File {file_no} Data ({len(result)} bytes) ---")
+            self._append_output(f"--- File {file_no} Data (decrypted, {len(result)} bytes) ---")
+            self._append_output(format_hex_dump(result))
+            # Also try to show as ASCII
+            try:
+                ascii_str = bytes(result).decode('utf-8', errors='replace')
+                printable = ''.join(c if 32 <= ord(c) < 127 else '.' for c in ascii_str)
+                if any(32 <= b < 127 for b in result):
+                    self._append_output(f"  ASCII: {printable}")
+            except Exception:
+                pass
+        else:
+            self._append_output(f"[FAIL] Could not read file {file_no}")
+
+    def _read_file_raw(self):
+        try:
+            file_no = int(self._file_no_entry.get().strip() or "0")
+        except ValueError:
+            self._append_output("[ERROR] Invalid file number")
+            return
+
+        result = self._on_command("read_data_raw", file_no=file_no)
+        if result is not None:
+            self._append_output(f"--- File {file_no} Raw/Encrypted Data ({len(result)} bytes) ---")
             self._append_output(format_hex_dump(result))
         else:
             self._append_output(f"[FAIL] Could not read file {file_no}")

@@ -296,6 +296,9 @@ class SmartCardApp(ctk.CTk):
             elif command == "read_data":
                 return self._desfire.read_data(kwargs["file_no"])
 
+            elif command == "read_data_raw":
+                return self._desfire.read_data_raw(kwargs["file_no"])
+
             elif command == "get_value":
                 return self._desfire.get_value(kwargs["file_no"])
 

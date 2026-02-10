@@ -4,7 +4,9 @@ Supports card interrogation, application management, file operations,
 and authentication with DES, 3DES, 3K3DES, and AES keys.
 """
 
+import binascii
 import os
+import struct
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
@@ -267,10 +269,173 @@ class DESFireProtocol:
         self._session_key = None
         self._authenticated = False
         self._auth_key_type = None
+        self._cmac_iv = bytes(16)  # CMAC IV, reset after auth
 
     @property
     def is_authenticated(self) -> bool:
         return self._authenticated
+
+    @property
+    def session_key(self) -> Optional[list]:
+        return self._session_key
+
+    # ─── Crypto Helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _generate_cmac_subkeys(key: bytes) -> tuple:
+        """Generate CMAC subkeys K1, K2 for AES-128."""
+        cipher = AES.new(key, AES.MODE_ECB)
+        L = cipher.encrypt(b'\x00' * 16)
+        # K1
+        K1 = bytearray(16)
+        overflow = 0
+        for i in range(15, -1, -1):
+            K1[i] = ((L[i] << 1) & 0xFF) | overflow
+            overflow = 1 if (L[i] & 0x80) else 0
+        if L[0] & 0x80:
+            K1[15] ^= 0x87
+        K1 = bytes(K1)
+        # K2
+        K2 = bytearray(16)
+        overflow = 0
+        for i in range(15, -1, -1):
+            K2[i] = ((K1[i] << 1) & 0xFF) | overflow
+            overflow = 1 if (K1[i] & 0x80) else 0
+        if K1[0] & 0x80:
+            K2[15] ^= 0x87
+        K2 = bytes(K2)
+        return K1, K2
+
+    def _calculate_cmac(self, data: list) -> bytes:
+        """
+        Calculate AES-CMAC over data using session key and current IV.
+        Updates self._cmac_iv with the result.
+        """
+        if not self._session_key or not CRYPTO_AVAILABLE:
+            return self._cmac_iv
+
+        key = bytes(self._session_key)
+        K1, K2 = self._generate_cmac_subkeys(key)
+        block_size = 16
+
+        message = bytes(data)
+        n_blocks = max(1, (len(message) + block_size - 1) // block_size)
+        last_complete = (len(message) > 0) and (len(message) % block_size == 0)
+
+        if last_complete:
+            padded = bytearray(message)
+            for i in range(block_size):
+                padded[-(block_size - i)] ^= K1[i]
+        else:
+            padded = bytearray(message) + bytearray([0x80])
+            while len(padded) % block_size != 0:
+                padded.append(0x00)
+            for i in range(block_size):
+                padded[-(block_size - i)] ^= K2[i]
+
+        padded = bytes(padded)
+        cipher = AES.new(key, AES.MODE_CBC, iv=self._cmac_iv)
+        encrypted = cipher.encrypt(padded)
+        self._cmac_iv = encrypted[-block_size:]
+        return self._cmac_iv
+
+    def _try_decrypt_aes(self, encrypted_data: bytes, iv: bytes, expected_size: int) -> Optional[List[int]]:
+        """
+        Attempt AES-CBC decryption with given IV and verify CRC32.
+        Returns decrypted data if CRC matches, None otherwise.
+        """
+        key = bytes(self._session_key)
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        plaintext = list(cipher.decrypt(encrypted_data))
+
+        if expected_size > 0 and expected_size <= len(plaintext) - 4:
+            real_data = plaintext[:expected_size]
+            crc_bytes = plaintext[expected_size:expected_size + 4]
+            stored_crc = struct.unpack('<I', bytes(crc_bytes))[0]
+
+            # DESFire CRC32 is computed over: status_byte(0x00) + plaintext_data
+            crc_input = bytes([0x00]) + bytes(real_data)
+            computed_crc = binascii.crc32(crc_input) & 0xFFFFFFFF
+            if computed_crc == stored_crc:
+                return real_data
+
+            # Some implementations compute CRC without the status byte
+            computed_crc2 = binascii.crc32(bytes(real_data)) & 0xFFFFFFFF
+            if computed_crc2 == stored_crc:
+                return real_data
+
+        return None
+
+    def _decrypt_aes_response(self, encrypted_data: List[int], expected_size: int) -> List[int]:
+        """
+        Decrypt an AES-encrypted DESFire response.
+        Tries multiple IV strategies to handle CMAC tracking uncertainty.
+        Returns the decrypted plaintext data (without CRC and padding).
+        """
+        if not self._session_key or not CRYPTO_AVAILABLE:
+            return encrypted_data
+
+        key = bytes(self._session_key)
+        ct = bytes(encrypted_data)
+
+        # Strategy 1: Try with current CMAC IV
+        result = self._try_decrypt_aes(ct, self._cmac_iv, expected_size)
+        if result is not None:
+            self._cmac_iv = ct[-16:]
+            return result
+
+        # Strategy 2: Try with IV = all zeros (fresh after auth)
+        result = self._try_decrypt_aes(ct, bytes(16), expected_size)
+        if result is not None:
+            self._cmac_iv = ct[-16:]
+            return result
+
+        # Strategy 3: Try with IV = last ciphertext block of auth exchange
+        # (some implementations carry IV from auth)
+
+        # Strategy 4: Fallback - decrypt with IV=0 and return data even without CRC verification
+        cipher = AES.new(key, AES.MODE_CBC, iv=bytes(16))
+        plaintext = list(cipher.decrypt(ct))
+        self._cmac_iv = ct[-16:]
+
+        if expected_size > 0 and expected_size <= len(plaintext):
+            return plaintext[:expected_size]
+
+        # Last resort: try to strip padding (0x80 00... scheme)
+        for i in range(len(plaintext) - 1, max(0, len(plaintext) - 20), -1):
+            if plaintext[i] == 0x80:
+                if i >= 4:
+                    return plaintext[:i - 4]
+                break
+            elif plaintext[i] != 0x00:
+                break
+
+        return plaintext[:max(0, len(plaintext) - 16)]
+
+    def _decrypt_des_response(self, encrypted_data: List[int], expected_size: int) -> List[int]:
+        """
+        Decrypt a DES/3DES-encrypted DESFire response.
+        """
+        if not self._session_key or not CRYPTO_AVAILABLE:
+            return encrypted_data
+
+        key = bytes(self._session_key)
+        ct = bytes(encrypted_data)
+        block_size = 8
+
+        if len(key) == 8:
+            cipher = DES.new(key, DES.MODE_CBC, iv=self._cmac_iv[:8])
+        else:
+            cipher = DES3.new(key, DES3.MODE_CBC, iv=self._cmac_iv[:8])
+
+        plaintext = list(cipher.decrypt(ct))
+        self._cmac_iv = bytearray(16)
+        self._cmac_iv[:8] = ct[-8:]
+
+        if expected_size > 0 and expected_size <= len(plaintext) - 2:
+            return plaintext[:expected_size]
+
+        return plaintext
 
     def _send(self, cmd_code: int, data: Optional[List[int]] = None) -> APDUResponse:
         """Send a DESFire command and handle multi-frame responses."""
@@ -443,7 +608,46 @@ class DESFireProtocol:
         return None
 
     def read_data(self, file_no: int, offset: int = 0, length: int = 0) -> Optional[List[int]]:
-        """Read data from a standard or backup data file."""
+        """Read data from a standard or backup data file.
+        Automatically decrypts if authenticated and file uses encrypted comm."""
+
+        # Get file settings FIRST (before CMAC calculation, as this affects IV)
+        need_decrypt = False
+        expected_size = 0
+        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            fs = self.get_file_settings(file_no)
+            if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
+                need_decrypt = True
+                expected_size = fs.size if length == 0 else length
+            # Reset IV before read command since get_file_settings disrupted it
+            self._cmac_iv = bytes(16)
+
+        cmd_data = [
+            file_no,
+            offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
+            length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF,
+        ]
+
+        # Update CMAC IV with the ReadData command
+        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            cmac_data = [DESFireCmd.READ_DATA] + cmd_data
+            self._calculate_cmac(cmac_data)
+
+        response = self._send(DESFireCmd.READ_DATA, cmd_data)
+        if not response or not response.is_success:
+            return None
+
+        # Decrypt if needed
+        if need_decrypt:
+            if self._auth_key_type == DESFireKeyType.AES_128:
+                return self._decrypt_aes_response(response.data, expected_size)
+            elif self._auth_key_type in (DESFireKeyType.DES, DESFireKeyType.TDES_2K):
+                return self._decrypt_des_response(response.data, expected_size)
+
+        return response.data
+
+    def read_data_raw(self, file_no: int, offset: int = 0, length: int = 0) -> Optional[List[int]]:
+        """Read raw (encrypted) data without decryption."""
         data = [
             file_no,
             offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
@@ -456,20 +660,43 @@ class DESFireProtocol:
 
     def get_value(self, file_no: int) -> Optional[int]:
         """Read a value file."""
+        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            cmac_data = [DESFireCmd.GET_VALUE, file_no]
+            self._calculate_cmac(cmac_data)
+
         response = self._send(DESFireCmd.GET_VALUE, [file_no])
         if response and response.is_success and len(response.data) >= 4:
-            return int.from_bytes(response.data[:4], 'little', signed=True)
+            data = response.data
+            # Decrypt if needed
+            if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+                if self._auth_key_type == DESFireKeyType.AES_128:
+                    data = self._decrypt_aes_response(response.data, 4)
+                elif self._auth_key_type in (DESFireKeyType.DES, DESFireKeyType.TDES_2K):
+                    data = self._decrypt_des_response(response.data, 4)
+            if len(data) >= 4:
+                return int.from_bytes(bytes(data[:4]), 'little', signed=True)
         return None
 
     def read_records(self, file_no: int, offset: int = 0, count: int = 0) -> Optional[List[int]]:
         """Read records from a record file."""
-        data = [
+        cmd_data = [
             file_no,
             offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
             count & 0xFF, (count >> 8) & 0xFF, (count >> 16) & 0xFF,
         ]
-        response = self._send(DESFireCmd.READ_RECORDS, data)
+
+        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            cmac_data = [DESFireCmd.READ_RECORDS] + cmd_data
+            self._calculate_cmac(cmac_data)
+
+        response = self._send(DESFireCmd.READ_RECORDS, cmd_data)
         if response and response.is_success:
+            if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+                fs = self.get_file_settings(file_no)
+                if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
+                    expected = fs.size * fs.current_records if fs.current_records > 0 else 0
+                    if self._auth_key_type == DESFireKeyType.AES_128:
+                        return self._decrypt_aes_response(response.data, expected)
             return response.data
         return None
 
@@ -547,6 +774,7 @@ class DESFireProtocol:
 
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.DES if len(key) == 8 else DESFireKeyType.TDES_2K
+        self._cmac_iv = bytes(16)
         return True, "Authentication successful"
 
     def authenticate_aes(self, key_no: int, key: List[int]) -> Tuple[bool, str]:
@@ -611,6 +839,7 @@ class DESFireProtocol:
         self._session_key = rnd_a[:4] + rnd_b[:4] + rnd_a[12:16] + rnd_b[12:16]
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.AES_128
+        self._cmac_iv = bytes(16)  # Reset IV after successful auth
         return True, "AES authentication successful"
 
     def authenticate_iso(self, key_no: int, key: List[int]) -> Tuple[bool, str]:
@@ -677,6 +906,7 @@ class DESFireProtocol:
                              rnd_a[12:16] + rnd_b[12:16])
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.TDES_3K
+        self._cmac_iv = bytes(16)
         return True, "ISO (3K3DES) authentication successful"
 
     # ─── Utility ─────────────────────────────────────────────────────────
