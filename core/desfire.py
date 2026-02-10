@@ -270,6 +270,7 @@ class DESFireProtocol:
         self._authenticated = False
         self._auth_key_type = None
         self._cmac_iv = bytes(16)  # CMAC IV, reset after auth
+        self._last_cmd_cmac_iv = None  # Saved command CMAC IV for encrypted decryption
 
     @property
     def is_authenticated(self) -> bool:
@@ -346,17 +347,25 @@ class DESFireProtocol:
 
     def _try_decrypt_with_iv(self, ct: bytes, iv: bytes) -> Optional[List[int]]:
         """
-        Try AES-CBC decryption with given IV and auto-detect data by CRC32.
-        Tries all possible data sizes and both CRC variants.
-        Returns decrypted data if CRC matches, None otherwise.
+        Try AES-CBC decryption with given IV and verify via DESFire CRC32.
+
+        DESFire EV1 encrypted response structure (AS_NEW / AES):
+            PAYLOAD || CRC32(PAYLOAD || STATUS=0x00) || PADDING
+
+        Where:
+        - CRC32 is DESFire CRC32 (JAMCRC: init=0xFFFFFFFF, no final XOR)
+        - STATUS byte 0x00 is appended to payload BEFORE CRC computation
+        - PADDING is either 0x80 + 0x00s, or pure 0x00s, to AES block boundary
+        - Verification: desfire_crc32(PAYLOAD || 0x00 || CRC_bytes) == 0
+
+        Reference: libfreefare mifare_desfire_crypto.c / mifare_cryto_postprocess_data
         """
         key = bytes(self._session_key)
         cipher = AES.new(key, AES.MODE_CBC, iv=iv)
         plaintext = cipher.decrypt(ct)
         total = len(plaintext)
 
-        # Try all possible data sizes (data + 4-byte CRC + padding = total)
-        # Padding is 0x80 followed by 0x00s, or no padding if data+CRC fills blocks
+        # Try all possible payload sizes (payload + 4-byte CRC + padding = total)
         for data_size in range(total - 4, 0, -1):
             crc_pos = data_size
             if crc_pos + 4 > total:
@@ -366,31 +375,28 @@ class DESFireProtocol:
             crc_bytes = plaintext[crc_pos:crc_pos + 4]
             stored_crc = struct.unpack('<I', crc_bytes)[0]
 
-            # Verify padding after CRC
+            # Verify padding after CRC:
+            # DESFire accepts 0x80 + 0x00s OR pure 0x00s padding
             padding = plaintext[crc_pos + 4:]
             if len(padding) > 0:
-                if padding[0:1] != b'\x80':
+                valid_padding = True
+                for i, b in enumerate(padding):
+                    if b == 0x00:
+                        continue
+                    elif b == 0x80 and i == 0:
+                        continue  # 0x80 allowed as first padding byte
+                    else:
+                        valid_padding = False
+                        break
+                if not valid_padding:
                     continue
-                if any(b != 0 for b in padding[1:]):
-                    continue
-            # else: no padding needed (data+CRC fills block exactly) - OK
+            # else: no padding needed (payload+CRC fills block exactly) - OK
 
-            # Try 4 CRC variants:
-            # 1. JAMCRC over (status=0x00 || data) — most common DESFire
-            crc_in = bytes([0x00]) + real_data
-            if self._desfire_crc32(crc_in) == stored_crc:
-                return list(real_data)
-
-            # 2. Standard CRC32 over (status=0x00 || data)
-            if (binascii.crc32(crc_in) & 0xFFFFFFFF) == stored_crc:
-                return list(real_data)
-
-            # 3. JAMCRC over data only
-            if self._desfire_crc32(real_data) == stored_crc:
-                return list(real_data)
-
-            # 4. Standard CRC32 over data only
-            if (binascii.crc32(real_data) & 0xFFFFFFFF) == stored_crc:
+            # DESFire CRC32: computed over PAYLOAD + STATUS(0x00)
+            # Per NXP spec: CRC = DESFire_CRC32(PAYLOAD || 0x00)
+            crc_input = bytes(real_data) + b'\x00'
+            computed_crc = self._desfire_crc32(crc_input)
+            if computed_crc == stored_crc:
                 return list(real_data)
 
         return None
@@ -398,9 +404,13 @@ class DESFireProtocol:
     def _decrypt_aes_auto(self, encrypted_data: List[int]) -> Optional[List[int]]:
         """
         Auto-decrypt AES-encrypted DESFire response.
-        Tries the current CMAC IV, then IV=0 as fallback.
-        Verifies decryption via CRC32.
-        Returns decrypted plaintext or None if decryption fails.
+
+        For encrypted communication (AS_NEW/AES), the card encrypts the response
+        using AES-CBC with IV = CMAC(command). After decryption, the IV for the
+        next operation is updated to the last ciphertext block (standard CBC chain).
+
+        Tries: saved command CMAC IV > current CMAC IV > IV=0 as fallback.
+        Verifies decryption via DESFire CRC32.
         """
         if not self._session_key or not CRYPTO_AVAILABLE:
             return None
@@ -409,13 +419,21 @@ class DESFireProtocol:
         if len(ct) == 0 or len(ct) % 16 != 0:
             return None
 
-        # Strategy 1: Current CMAC IV (correct if no intermediate cmds since auth)
+        # Strategy 1: Command CMAC IV (saved before AF processing — correct IV)
+        if self._last_cmd_cmac_iv is not None:
+            result = self._try_decrypt_with_iv(ct, self._last_cmd_cmac_iv)
+            if result is not None:
+                # Update IV to last ciphertext block for next operation
+                self._cmac_iv = ct[-16:]
+                return result
+
+        # Strategy 2: Current CMAC IV (may differ from cmd IV if AF frames occurred)
         result = self._try_decrypt_with_iv(ct, self._cmac_iv)
         if result is not None:
-            self._cmac_iv = ct[-16:]  # Update IV for next operation
+            self._cmac_iv = ct[-16:]
             return result
 
-        # Strategy 2: IV = 0 (in case CMAC tracking was never needed)
+        # Strategy 3: IV = 0 (fallback in case CMAC tracking was lost)
         result = self._try_decrypt_with_iv(ct, bytes(16))
         if result is not None:
             self._cmac_iv = ct[-16:]
@@ -451,16 +469,20 @@ class DESFireProtocol:
     def _send(self, cmd_code: int, data: Optional[List[int]] = None) -> APDUResponse:
         """Send a DESFire command and handle multi-frame responses.
 
-        When authenticated with AES, tracks CMAC IV for commands only.
-        Response CMAC is NOT tracked here because:
-        - We don't know if the response includes MAC bytes
-        - For encrypted responses, IV update is handled after decryption
+        When authenticated with AES, tracks CMAC IV for commands.
+        Saves the command CMAC IV (before AF processing) for encrypted
+        response decryption. AF frame CMACs update the general IV state
+        but the saved command IV is used for decryption.
         """
         # Track CMAC for the command when AES-authenticated
+        self._last_cmd_cmac_iv = None
         if (self._authenticated and self._session_key and CRYPTO_AVAILABLE
                 and self._auth_key_type == DESFireKeyType.AES_128):
             cmac_input = [cmd_code] + (data or [])
             self._calculate_cmac(cmac_input)
+            # Save IV right after command CMAC — this is the correct IV
+            # for decrypting encrypted responses (before any AF CMACs)
+            self._last_cmd_cmac_iv = bytes(self._cmac_iv)
 
         apdu = desfire_command(cmd_code, data)
         response = self._transmit(apdu)
@@ -470,7 +492,7 @@ class DESFireProtocol:
         # Handle additional frames
         full_data = list(response.data)
         while response.has_more_data:
-            # Track CMAC for AF command
+            # Track CMAC for AF command (needed for MAC mode IV tracking)
             if (self._authenticated and self._session_key and CRYPTO_AVAILABLE
                     and self._auth_key_type == DESFireKeyType.AES_128):
                 self._calculate_cmac([DESFireCmd.ADDITIONAL_FRAME])
@@ -797,6 +819,7 @@ class DESFireProtocol:
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.DES if len(key) == 8 else DESFireKeyType.TDES_2K
         self._cmac_iv = bytes(16)
+        self._last_cmd_cmac_iv = None
         return True, "Authentication successful"
 
     def authenticate_aes(self, key_no: int, key: List[int]) -> Tuple[bool, str]:
@@ -862,6 +885,7 @@ class DESFireProtocol:
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.AES_128
         self._cmac_iv = bytes(16)  # Reset IV after successful auth
+        self._last_cmd_cmac_iv = None
         return True, "AES authentication successful"
 
     def authenticate_iso(self, key_no: int, key: List[int]) -> Tuple[bool, str]:
@@ -929,6 +953,7 @@ class DESFireProtocol:
         self._authenticated = True
         self._auth_key_type = DESFireKeyType.TDES_3K
         self._cmac_iv = bytes(16)
+        self._last_cmd_cmac_iv = None
         return True, "ISO (3K3DES) authentication successful"
 
     # ─── Utility ─────────────────────────────────────────────────────────
