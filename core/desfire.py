@@ -437,8 +437,20 @@ class DESFireProtocol:
 
         return plaintext
 
-    def _send(self, cmd_code: int, data: Optional[List[int]] = None) -> APDUResponse:
-        """Send a DESFire command and handle multi-frame responses."""
+    def _send(self, cmd_code: int, data: Optional[List[int]] = None,
+              _encrypted_response: bool = False) -> APDUResponse:
+        """Send a DESFire command and handle multi-frame responses.
+
+        When authenticated with AES, tracks CMAC IV for all commands/responses.
+        Set _encrypted_response=True when the response will be encrypted
+        (the caller must handle response CMAC after decryption).
+        """
+        # Track CMAC for the command when AES-authenticated
+        if (self._authenticated and self._session_key and CRYPTO_AVAILABLE
+                and self._auth_key_type == DESFireKeyType.AES_128):
+            cmac_input = [cmd_code] + (data or [])
+            self._calculate_cmac(cmac_input)
+
         apdu = desfire_command(cmd_code, data)
         response = self._transmit(apdu)
         if not response:
@@ -447,6 +459,10 @@ class DESFireProtocol:
         # Handle additional frames
         full_data = list(response.data)
         while response.has_more_data:
+            # Track CMAC for AF command
+            if (self._authenticated and self._session_key and CRYPTO_AVAILABLE
+                    and self._auth_key_type == DESFireKeyType.AES_128):
+                self._calculate_cmac([DESFireCmd.ADDITIONAL_FRAME])
             apdu = desfire_command(DESFireCmd.ADDITIONAL_FRAME)
             response = self._transmit(apdu)
             if response:
@@ -454,7 +470,18 @@ class DESFireProtocol:
             else:
                 break
 
-        return APDUResponse(full_data, response.sw1, response.sw2)
+        final = APDUResponse(full_data, response.sw1, response.sw2)
+
+        # Track CMAC for the response (status + data) for PLAIN/MAC comm
+        # For encrypted responses, the caller handles IV update after decryption
+        if (not _encrypted_response
+                and self._authenticated and self._session_key and CRYPTO_AVAILABLE
+                and self._auth_key_type == DESFireKeyType.AES_128
+                and final.is_success):
+            resp_cmac_input = [0x00] + list(final.data)  # 0x00 = success status
+            self._calculate_cmac(resp_cmac_input)
+
+        return final
 
     # ─── PICC Level Commands ─────────────────────────────────────────────
 
@@ -609,9 +636,13 @@ class DESFireProtocol:
 
     def read_data(self, file_no: int, offset: int = 0, length: int = 0) -> Optional[List[int]]:
         """Read data from a standard or backup data file.
-        Automatically decrypts if authenticated and file uses encrypted comm."""
+        Automatically decrypts if authenticated and file uses encrypted comm.
 
-        # Get file settings FIRST (before CMAC calculation, as this affects IV)
+        The CMAC IV is tracked through ALL commands (including get_file_settings)
+        so that by the time we send ReadData, our IV matches the card's IV.
+        """
+        # Get file settings to check comm mode
+        # _send() tracks CMAC for this command + response automatically
         need_decrypt = False
         expected_size = 0
         if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
@@ -619,8 +650,6 @@ class DESFireProtocol:
             if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
                 need_decrypt = True
                 expected_size = fs.size if length == 0 else length
-            # Reset IV before read command since get_file_settings disrupted it
-            self._cmac_iv = bytes(16)
 
         cmd_data = [
             file_no,
@@ -628,23 +657,23 @@ class DESFireProtocol:
             length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF,
         ]
 
-        # Update CMAC IV with the ReadData command
-        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
-            cmac_data = [DESFireCmd.READ_DATA] + cmd_data
-            self._calculate_cmac(cmac_data)
-
-        response = self._send(DESFireCmd.READ_DATA, cmd_data)
-        if not response or not response.is_success:
-            return None
-
-        # Decrypt if needed
         if need_decrypt:
+            # Send ReadData: _send() tracks command CMAC, skips response CMAC
+            # (response is encrypted, so we handle IV update after decryption)
+            response = self._send(DESFireCmd.READ_DATA, cmd_data, _encrypted_response=True)
+            if not response or not response.is_success:
+                return None
             if self._auth_key_type == DESFireKeyType.AES_128:
                 return self._decrypt_aes_response(response.data, expected_size)
             elif self._auth_key_type in (DESFireKeyType.DES, DESFireKeyType.TDES_2K):
                 return self._decrypt_des_response(response.data, expected_size)
-
-        return response.data
+            return response.data
+        else:
+            # PLAIN mode: _send() tracks everything
+            response = self._send(DESFireCmd.READ_DATA, cmd_data)
+            if not response or not response.is_success:
+                return None
+            return response.data
 
     def read_data_raw(self, file_no: int, offset: int = 0, length: int = 0) -> Optional[List[int]]:
         """Read raw (encrypted) data without decryption."""
@@ -660,15 +689,21 @@ class DESFireProtocol:
 
     def get_value(self, file_no: int) -> Optional[int]:
         """Read a value file."""
+        # Check comm mode first
+        need_decrypt = False
         if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
-            cmac_data = [DESFireCmd.GET_VALUE, file_no]
-            self._calculate_cmac(cmac_data)
+            fs = self.get_file_settings(file_no)
+            if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
+                need_decrypt = True
 
-        response = self._send(DESFireCmd.GET_VALUE, [file_no])
+        if need_decrypt:
+            response = self._send(DESFireCmd.GET_VALUE, [file_no], _encrypted_response=True)
+        else:
+            response = self._send(DESFireCmd.GET_VALUE, [file_no])
+
         if response and response.is_success and len(response.data) >= 4:
             data = response.data
-            # Decrypt if needed
-            if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            if need_decrypt:
                 if self._auth_key_type == DESFireKeyType.AES_128:
                     data = self._decrypt_aes_response(response.data, 4)
                 elif self._auth_key_type in (DESFireKeyType.DES, DESFireKeyType.TDES_2K):
@@ -679,25 +714,31 @@ class DESFireProtocol:
 
     def read_records(self, file_no: int, offset: int = 0, count: int = 0) -> Optional[List[int]]:
         """Read records from a record file."""
+        # Get file settings to check comm mode (tracks CMAC automatically)
+        need_decrypt = False
+        expected = 0
+        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
+            fs = self.get_file_settings(file_no)
+            if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
+                need_decrypt = True
+                expected = fs.size * fs.current_records if fs.current_records > 0 else 0
+
         cmd_data = [
             file_no,
             offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
             count & 0xFF, (count >> 8) & 0xFF, (count >> 16) & 0xFF,
         ]
 
-        if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
-            cmac_data = [DESFireCmd.READ_RECORDS] + cmd_data
-            self._calculate_cmac(cmac_data)
-
-        response = self._send(DESFireCmd.READ_RECORDS, cmd_data)
-        if response and response.is_success:
-            if self._authenticated and self._session_key and CRYPTO_AVAILABLE:
-                fs = self.get_file_settings(file_no)
-                if fs and fs.comm_mode == DESFireCommMode.ENCRYPTED:
-                    expected = fs.size * fs.current_records if fs.current_records > 0 else 0
-                    if self._auth_key_type == DESFireKeyType.AES_128:
-                        return self._decrypt_aes_response(response.data, expected)
-            return response.data
+        if need_decrypt:
+            response = self._send(DESFireCmd.READ_RECORDS, cmd_data, _encrypted_response=True)
+            if response and response.is_success:
+                if self._auth_key_type == DESFireKeyType.AES_128:
+                    return self._decrypt_aes_response(response.data, expected)
+                return response.data
+        else:
+            response = self._send(DESFireCmd.READ_RECORDS, cmd_data)
+            if response and response.is_success:
+                return response.data
         return None
 
     # ─── Authentication ──────────────────────────────────────────────────
