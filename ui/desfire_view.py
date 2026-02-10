@@ -437,7 +437,7 @@ class DESFireView(ctk.CTkFrame):
 
         result = self._on_command("read_data", file_no=file_no)
         if result is not None:
-            self._append_output(f"--- File {file_no} Data (decrypted, {len(result)} bytes) ---")
+            self._append_output(f"--- File {file_no} Data ({len(result)} bytes) ---")
             self._append_output(format_hex_dump(result))
             # Also try to show as ASCII
             try:
