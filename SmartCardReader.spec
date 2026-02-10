@@ -1,16 +1,54 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
 
-datas = []
-datas += collect_data_files('customtkinter')
+import os
 
+# Collect all .py files from core/ and ui/ packages
+block_cipher = None
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
-    datas=datas,
-    hiddenimports=['smartcard', 'smartcard.System', 'smartcard.CardConnection', 'smartcard.CardMonitoring', 'smartcard.ReaderMonitoring', 'smartcard.Exceptions', 'smartcard.util', 'smartcard.pcsc', 'smartcard.pcsc.PCSCReader', 'smartcard.pcsc.PCSCCardConnection', 'smartcard.scard', 'Crypto', 'Crypto.Cipher', 'Crypto.Cipher.AES', 'Crypto.Cipher.DES', 'Crypto.Cipher.DES3', 'customtkinter', 'darkdetect', 'PIL'],
+    datas=[],
+    hiddenimports=[
+        'core',
+        'core.apdu',
+        'core.atr_parser',
+        'core.desfire',
+        'core.diversification',
+        'core.javacard',
+        'core.legic',
+        'core.reader_manager',
+        'ui',
+        'ui.app',
+        'ui.apdu_console',
+        'ui.card_info_view',
+        'ui.desfire_view',
+        'ui.diversification_view',
+        'ui.javacard_view',
+        'ui.legic_view',
+        'ui.log_panel',
+        'ui.reader_panel',
+        'ui.theme',
+        'customtkinter',
+        'PIL',
+        'smartcard',
+        'smartcard.System',
+        'smartcard.CardConnection',
+        'smartcard.CardMonitoring',
+        'smartcard.ReaderMonitoring',
+        'smartcard.Exceptions',
+        'smartcard.pcsc',
+        'smartcard.pcsc.PCSCReader',
+        'smartcard.pcsc.PCSCContext',
+        'smartcard.pcsc.PCSCCardConnection',
+        'smartcard.scard',
+        'Crypto',
+        'Crypto.Cipher',
+        'Crypto.Cipher.AES',
+        'Crypto.Cipher.DES',
+        'Crypto.Cipher.DES3',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -39,4 +77,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='NONE',
 )
