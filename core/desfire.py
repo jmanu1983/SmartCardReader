@@ -423,7 +423,6 @@ class DESFireProtocol:
         if self._last_cmd_cmac_iv is not None:
             result = self._try_decrypt_with_iv(ct, self._last_cmd_cmac_iv)
             if result is not None:
-                # Update IV to last ciphertext block for next operation
                 self._cmac_iv = ct[-16:]
                 return result
 
